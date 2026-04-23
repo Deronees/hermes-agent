@@ -7904,23 +7904,36 @@ class HermesCLI:
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
 
+        codex_route = None
+        if isinstance(message, str):
+            try:
+                from tools.codex_sdk_tool import parse_codex_command_prefix
+
+                codex_route = parse_codex_command_prefix(message)
+            except Exception as exc:
+                logger.debug("Codex prefix parse failed: %s", exc)
+                codex_route = None
+        if codex_route:
+            message = codex_route.get("prompt", "")
+
         # Refresh provider credentials if needed (handles key rotation transparently)
-        if not self._ensure_runtime_credentials():
+        if not codex_route and not self._ensure_runtime_credentials():
             return None
 
-        turn_route = self._resolve_turn_agent_config(message)
-        if turn_route["signature"] != self._active_agent_route_signature:
-            self.agent = None
+        if not codex_route:
+            turn_route = self._resolve_turn_agent_config(message)
+            if turn_route["signature"] != self._active_agent_route_signature:
+                self.agent = None
 
-        # Initialize agent if needed
-        if self.agent is None:
-            _cprint(f"{_DIM}Initializing agent...{_RST}")
-        if not self._init_agent(
-            model_override=turn_route["model"],
-            runtime_override=turn_route["runtime"],
-            request_overrides=turn_route.get("request_overrides"),
-        ):
-            return None
+            # Initialize agent if needed
+            if self.agent is None:
+                _cprint(f"{_DIM}Initializing agent...{_RST}")
+            if not self._init_agent(
+                model_override=turn_route["model"],
+                runtime_override=turn_route["runtime"],
+                request_overrides=turn_route.get("request_overrides"),
+            ):
+                return None
         
         # Pre-process images through the vision tool (Gemini Flash) so the
         # main model receives text descriptions instead of raw base64 image
@@ -7968,6 +7981,7 @@ class HermesCLI:
         try:
             # Run the conversation with interrupt monitoring
             result = None
+            active_runner = {"runner": self.agent if not codex_route else None}
 
             # Reset streaming display state for this turn
             self._reset_stream_state()
@@ -8047,22 +8061,54 @@ class HermesCLI:
             def run_agent():
                 nonlocal result
                 agent_message = _voice_prefix + message if _voice_prefix else message
-                # Prepend pending model switch note so the model knows about the switch
-                _msn = getattr(self, '_pending_model_switch_note', None)
-                if _msn:
-                    agent_message = _msn + "\n\n" + agent_message
-                    self._pending_model_switch_note = None
                 try:
-                    result = self.agent.run_conversation(
-                        user_message=agent_message,
-                        conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
-                        stream_callback=stream_callback,
-                        task_id=self.session_id,
-                        persist_user_message=message if _voice_prefix else None,
-                    )
+                    if codex_route:
+                        from tools.codex_sdk_tool import CodexTaskHandle, run_codex_turn
+
+                        mode = str(codex_route.get("mode") or "standard")
+                        if codex_route.get("error"):
+                            user_content = f"@CODEX:{mode}" if mode != "standard" else "@CODEX"
+                            result = {
+                                "final_response": f"Error: {codex_route['error']}",
+                                "messages": self.conversation_history[:-1] + [
+                                    {"role": "user", "content": user_content},
+                                    {"role": "assistant", "content": f"Error: {codex_route['error']}"},
+                                ],
+                                "api_calls": 0,
+                                "completed": False,
+                                "failed": True,
+                                "error": codex_route["error"],
+                            }
+                        else:
+                            codex_handle = CodexTaskHandle(model=f"codex-sdk:{mode}")
+                            active_runner["runner"] = codex_handle
+                            result = run_codex_turn(
+                                user_message=message,
+                                prompt=agent_message,
+                                conversation_history=self.conversation_history[:-1],
+                                mode=mode,
+                                cwd=os.getenv("TERMINAL_CWD") or os.getcwd(),
+                                progress_callback=self._on_tool_progress if self.tool_progress_mode != "off" else None,
+                                control=codex_handle,
+                            )
+                    else:
+                        active_runner["runner"] = self.agent
+                        # Prepend pending model switch note so the model knows about the switch
+                        _msn = getattr(self, '_pending_model_switch_note', None)
+                        if _msn:
+                            agent_message = _msn + "\n\n" + agent_message
+                            self._pending_model_switch_note = None
+                        result = self.agent.run_conversation(
+                            user_message=agent_message,
+                            conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
+                            stream_callback=stream_callback,
+                            task_id=self.session_id,
+                            persist_user_message=message if _voice_prefix else None,
+                        )
                 except Exception as exc:
                     logging.error("run_conversation raised: %s", exc, exc_info=True)
-                    _summary = getattr(self.agent, '_summarize_api_error', lambda e: str(e)[:300])(exc)
+                    _runner = active_runner.get("runner")
+                    _summary = getattr(_runner, '_summarize_api_error', lambda e: str(e)[:300])(exc)
                     result = {
                         "final_response": f"Error: {_summary}",
                         "messages": [],
@@ -8099,17 +8145,20 @@ class HermesCLI:
                             # Signal TTS to stop on interrupt
                             if stop_event is not None:
                                 stop_event.set()
-                            self.agent.interrupt(interrupt_msg)
+                            _runner = active_runner.get("runner")
+                            if _runner is not None and hasattr(_runner, "interrupt"):
+                                _runner.interrupt(interrupt_msg)
                             # Debug: log to file (stdout may be devnull from redirect_stdout)
                             try:
-                                _dbg = _hermes_home / "interrupt_debug.log"
-                                with open(_dbg, "a") as _f:
-                                    import time as _t
-                                    _f.write(f"{_t.strftime('%H:%M:%S')} interrupt fired: msg={str(interrupt_msg)[:60]!r}, "
-                                             f"children={len(self.agent._active_children)}, "
-                                             f"parent._interrupt={self.agent._interrupt_requested}\n")
-                                    for _ci, _ch in enumerate(self.agent._active_children):
-                                        _f.write(f"  child[{_ci}]._interrupt={_ch._interrupt_requested}\n")
+                                if _runner is self.agent and self.agent is not None:
+                                    _dbg = _hermes_home / "interrupt_debug.log"
+                                    with open(_dbg, "a") as _f:
+                                        import time as _t
+                                        _f.write(f"{_t.strftime('%H:%M:%S')} interrupt fired: msg={str(interrupt_msg)[:60]!r}, "
+                                                 f"children={len(self.agent._active_children)}, "
+                                                 f"parent._interrupt={self.agent._interrupt_requested}\n")
+                                        for _ci, _ch in enumerate(self.agent._active_children):
+                                            _f.write(f"  child[{_ci}]._interrupt={_ch._interrupt_requested}\n")
                             except Exception:
                                 pass
                             break
@@ -10523,10 +10572,40 @@ def main(
     # Handle single query mode
     if query or image:
         query, single_query_images = _collect_query_images(query, image)
+        try:
+            from tools.codex_sdk_tool import parse_codex_command_prefix, run_codex_task
+        except Exception:
+            parse_codex_command_prefix = None
+            run_codex_task = None
+        codex_route = parse_codex_command_prefix(query) if (parse_codex_command_prefix and isinstance(query, str)) else None
         if quiet:
             # Quiet mode: suppress banner, spinner, tool previews.
             # Only print the final response and parseable session info.
             cli.tool_progress_mode = "off"
+            if codex_route:
+                if codex_route.get("error"):
+                    print(f"Error: {codex_route['error']}")
+                    sys.exit(1)
+                effective_query = codex_route["prompt"]
+                if single_query_images:
+                    effective_query = cli._preprocess_images_with_vision(
+                        effective_query,
+                        single_query_images,
+                        announce=False,
+                    )
+                result = run_codex_task(
+                    effective_query,
+                    mode=codex_route["mode"],
+                    cwd=os.getenv("TERMINAL_CWD") or os.getcwd(),
+                )
+                response = result.get("final_response", "") if isinstance(result, dict) else ""
+                if not response and isinstance(result, dict) and result.get("error"):
+                    response = f"Error: {result['error']}"
+                if response:
+                    print(response)
+                print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+                sys.exit(1 if isinstance(result, dict) and not result.get("success") else 0)
+
             if cli._ensure_runtime_credentials():
                 effective_query = query
                 if single_query_images:

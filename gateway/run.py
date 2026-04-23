@@ -3727,6 +3727,16 @@ class GatewayRunner:
         """
         history = history or []
         message_text = event.text or ""
+        try:
+            from tools.codex_sdk_tool import parse_codex_command_prefix
+
+            _codex_route = parse_codex_command_prefix(message_text) if isinstance(message_text, str) else None
+        except Exception as exc:
+            logger.debug("@CODEX prefix parse failed: %s", exc)
+            _codex_route = None
+        setattr(event, "_hermes_codex_route", _codex_route)
+        if _codex_route:
+            message_text = _codex_route.get("prompt", "")
 
         _is_shared_thread = (
             source.chat_type != "dm"
@@ -4355,6 +4365,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                codex_route=getattr(event, "_hermes_codex_route", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -9060,6 +9071,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        codex_route: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -9074,7 +9086,7 @@ class GatewayRunner:
         Supports interruption via new messages.
         """
         # ---- Proxy mode: delegate to remote API server ----
-        if self._get_proxy_url():
+        if self._get_proxy_url() and not codex_route:
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -9451,6 +9463,59 @@ class GatewayRunner:
                 load_dotenv(_env_path, override=True, encoding="latin-1")
             except Exception:
                 pass
+
+            if codex_route:
+                from tools.codex_sdk_tool import CodexTaskHandle, run_codex_turn
+
+                mode = str(codex_route.get("mode") or "standard")
+                if codex_route.get("error"):
+                    user_content = f"@CODEX:{mode}" if mode != "standard" else "@CODEX"
+                    result = {
+                        "final_response": f"Error: {codex_route['error']}",
+                        "messages": history + [
+                            {"role": "user", "content": user_content},
+                            {"role": "assistant", "content": f"Error: {codex_route['error']}"},
+                        ],
+                        "api_calls": 0,
+                        "failed": True,
+                        "error": codex_route["error"],
+                        "response_previewed": False,
+                    }
+                else:
+                    codex_handle = CodexTaskHandle(model=f"codex-sdk:{mode}")
+                    agent_holder[0] = codex_handle
+                    result = run_codex_turn(
+                        user_message=message,
+                        prompt=message,
+                        conversation_history=history,
+                        mode=mode,
+                        cwd=os.getenv("TERMINAL_CWD") or os.getcwd(),
+                        progress_callback=progress_callback if tool_progress_enabled else None,
+                        control=codex_handle,
+                    )
+
+                result_holder[0] = result
+                _usage = result.get("usage") or {}
+                _input_toks = int(_usage.get("input_tokens") or 0)
+                _output_toks = int(_usage.get("output_tokens") or 0)
+                final_response = result.get("final_response") or ""
+                if not final_response and result.get("error"):
+                    final_response = f"Error: {result['error']}"
+                return {
+                    "final_response": final_response,
+                    "messages": result.get("messages", history),
+                    "api_calls": result.get("api_calls", 0),
+                    "failed": result.get("failed", False),
+                    "interrupted": result.get("interrupted", False),
+                    "error": result.get("error"),
+                    "tools": [],
+                    "history_offset": len(history),
+                    "last_prompt_tokens": 0,
+                    "input_tokens": _input_toks,
+                    "output_tokens": _output_toks,
+                    "model": f"codex-sdk:{mode}",
+                    "response_previewed": False,
+                }
 
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -10532,6 +10597,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    codex_route=getattr(pending_event, "_hermes_codex_route", None) if pending_event is not None else None,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task

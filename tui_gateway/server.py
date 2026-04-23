@@ -1506,6 +1506,14 @@ def _(rid, params: dict) -> dict:
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
             prompt = text
+            try:
+                from tools.codex_sdk_tool import parse_codex_command_prefix
+
+                codex_route = parse_codex_command_prefix(prompt) if isinstance(prompt, str) else None
+            except Exception:
+                codex_route = None
+            if codex_route:
+                prompt = codex_route.get("prompt", "")
 
             if isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
@@ -1535,10 +1543,42 @@ def _(rid, params: dict) -> dict:
                     payload["rendered"] = r
                 _emit("message.delta", sid, payload)
 
-            result = agent.run_conversation(
-                prompt, conversation_history=list(history),
-                stream_callback=_stream,
-            )
+            if codex_route:
+                from tools.codex_sdk_tool import run_codex_turn
+
+                mode = str(codex_route.get("mode") or "standard")
+                if codex_route.get("error"):
+                    user_content = f"@CODEX:{mode}" if mode != "standard" else "@CODEX"
+                    result = {
+                        "final_response": f"Error: {codex_route['error']}",
+                        "messages": list(history) + [
+                            {"role": "user", "content": user_content},
+                            {"role": "assistant", "content": f"Error: {codex_route['error']}"},
+                        ],
+                        "failed": True,
+                        "error": codex_route["error"],
+                        "usage": None,
+                    }
+                else:
+                    result = run_codex_turn(
+                        user_message=prompt,
+                        prompt=prompt,
+                        conversation_history=list(history),
+                        mode=mode,
+                        cwd=os.environ.get("TERMINAL_CWD", os.getcwd()),
+                        progress_callback=lambda event_type, name=None, preview=None, args=None, **kwargs: _on_tool_progress(
+                            sid, event_type, name, preview, args, **kwargs
+                        ),
+                        tool_start_callback=lambda tc_id, name, args: _on_tool_start(sid, tc_id, name, args),
+                        tool_complete_callback=lambda tc_id, name, args, result_json: _on_tool_complete(
+                            sid, tc_id, name, args, result_json
+                        ),
+                    )
+            else:
+                result = agent.run_conversation(
+                    prompt, conversation_history=list(history),
+                    stream_callback=_stream,
+                )
 
             last_reasoning = None
             status_note = None
@@ -1577,7 +1617,12 @@ def _(rid, params: dict) -> dict:
                 raw = str(result)
                 status = "complete"
 
-            payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            usage_payload = result.get("usage") if isinstance(result, dict) else None
+            payload = {
+                "text": raw,
+                "usage": usage_payload if isinstance(usage_payload, dict) else _get_usage(agent),
+                "status": status,
+            }
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
