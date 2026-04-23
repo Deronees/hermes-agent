@@ -546,6 +546,25 @@ DEFAULT_CONFIG = {
             "timeout": 30,
         },
     },
+
+    "codex_sdk": {
+        "enabled": True,
+        "node_command": "node",
+        "codex_command": "codex",
+        "timeout_seconds": 900,
+        "allowed_roots": [],
+        "modes": {
+            "standard": {
+                "config_overrides": {},
+                "env": {},
+            },
+            "computer_use": {
+                "enabled": False,
+                "config_overrides": {},
+                "env": {},
+            },
+        },
+    },
     
     "display": {
         "compact": False,
@@ -812,7 +831,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 19,
+    "_config_version": 20,
 }
 
 # =============================================================================
@@ -1978,7 +1997,7 @@ _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
-    "auxiliary", "custom_providers", "context", "memory", "gateway",
+    "auxiliary", "codex_sdk", "custom_providers", "context", "memory", "gateway",
 }
 
 # Valid fields inside a custom_providers list entry

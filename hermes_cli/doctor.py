@@ -414,6 +414,42 @@ def run_doctor(args):
     else:
         check_warn("codex CLI not found", "(required for openai-codex login)")
 
+    try:
+        from hermes_cli.config import load_config
+
+        codex_sdk = (load_config().get("codex_sdk") or {})
+        if not isinstance(codex_sdk, dict):
+            codex_sdk = {}
+
+        if codex_sdk.get("enabled", True):
+            node_command = str(codex_sdk.get("node_command") or "node").strip() or "node"
+            if shutil.which(node_command):
+                check_ok(f"Codex SDK node runtime", f"({node_command})")
+            else:
+                check_warn(
+                    "Codex SDK node runtime not found",
+                    f"(configure codex_sdk.node_command, current: {node_command})",
+                )
+
+            codex_command = str(codex_sdk.get("codex_command") or "codex").strip() or "codex"
+            if shutil.which(codex_command):
+                check_ok(f"Codex SDK CLI command", f"({codex_command})")
+            else:
+                check_warn(
+                    "Codex SDK CLI command not found",
+                    f"(configure codex_sdk.codex_command, current: {codex_command})",
+                )
+
+            computer_use_cfg = (codex_sdk.get("modes") or {}).get("computer_use", {})
+            if isinstance(computer_use_cfg, dict) and computer_use_cfg.get("enabled"):
+                check_info("Codex computer_use mode is enabled in config.")
+            else:
+                check_info("Codex computer_use mode is disabled in config.")
+        else:
+            check_info("Codex SDK adapter disabled in config.yaml.")
+    except Exception as e:
+        check_warn("Codex SDK adapter config", f"(could not check: {e})")
+
     # =========================================================================
     # Check: Directory structure
     # =========================================================================

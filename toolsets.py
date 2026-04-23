@@ -192,6 +192,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "codex": {
+        "description": "One-shot Codex SDK delegation for explicit @CODEX tasks",
+        "tools": ["codex_run_task"],
+        "includes": []
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 
